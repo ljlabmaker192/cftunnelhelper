@@ -1,0 +1,3 @@
+wget -O /tmp/install-cftunnel.sh https://raw.githubusercontent.com/ljlabmaker192/cftunnelhelper/main/install.sh
+sudo chmod +x /tmp/install-cftunnel.sh
+sudo /tmp/install-cftunnel.sh    to install
