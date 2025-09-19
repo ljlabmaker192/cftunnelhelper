@@ -1,1 +1,1961 @@
+#!/bin/bash
 
+# CF Tunnel Helper - Professional Installation Script
+# Version: 3.0.0
+# GitHub: https://github.com/ljlabmaker192/cftunnelhelper
+
+set -euo pipefail
+
+# Configuration
+readonly APP_NAME="cftunnelhelper"
+readonly INSTALL_DIR="/opt/$APP_NAME"
+readonly BIN_LINK="/usr/local/bin/$APP_NAME"
+readonly SERVICE_FILE="/etc/systemd/system/$APP_NAME.service"
+readonly LOG_DIR="/var/log/$APP_NAME"
+readonly CONFIG_DIR="/etc/$APP_NAME"
+
+# Colors for output
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly CYAN='\033[0;36m'
+readonly BOLD='\033[1m'
+readonly NC='\033[0m' # No Color
+
+# Logging functions
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+log_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+log_header() {
+    echo -e "${BOLD}${CYAN}$1${NC}"
+}
+
+# Check if running as root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script must be run as root. Please use sudo."
+        exit 1
+    fi
+}
+
+# Detect Ubuntu version
+detect_ubuntu_version() {
+    if [[ ! -f /etc/os-release ]]; then
+        log_error "Cannot detect OS version"
+        exit 1
+    fi
+    
+    source /etc/os-release
+    if [[ "$ID" != "ubuntu" ]]; then
+        log_warning "This script is designed for Ubuntu, but will attempt to install on $ID"
+    fi
+    
+    log_info "Detected: $PRETTY_NAME"
+}
+
+# Create directories
+create_directories() {
+    log_info "Creating directories..."
+    mkdir -p "$INSTALL_DIR" "$LOG_DIR" "$CONFIG_DIR"
+    chmod 755 "$INSTALL_DIR" "$LOG_DIR" "$CONFIG_DIR"
+}
+
+# Install system dependencies
+install_dependencies() {
+    log_info "Installing system dependencies..."
+    
+    # Update package list
+    apt update -qq
+    
+    # Install base packages
+    apt install -y \
+        python3 \
+        python3-pip \
+        python3-flask \
+        python3-requests \
+        python3-psutil \
+        curl \
+        wget \
+        sudo \
+        systemd \
+        ufw \
+        net-tools \
+        2>/dev/null || {
+        
+        # Fallback for older Ubuntu versions
+        log_warning "Some packages not available, installing alternatives..."
+        apt install -y python3 python3-pip curl wget sudo systemd
+        pip3 install --break-system-packages flask requests psutil 2>/dev/null || \
+        pip3 install flask requests psutil
+    }
+}
+
+# Install cloudflared with version detection
+install_cloudflared() {
+    log_info "Installing cloudflared..."
+    
+    local temp_deb="/tmp/cloudflared.deb"
+    
+    # Detect architecture
+    local arch
+    case "$(uname -m)" in
+        x86_64) arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        armv7l) arch="armhf" ;;
+        *) arch="amd64" ;;
+    esac
+    
+    log_info "Detected architecture: $arch"
+    
+    # Download and install
+    wget -q -O "$temp_deb" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}.deb"
+    
+    if dpkg -i "$temp_deb" 2>/dev/null; then
+        log_success "cloudflared installed successfully"
+    else
+        log_warning "Fixing dependencies..."
+        apt install -f -y
+    fi
+    
+    rm -f "$temp_deb"
+    
+    # Verify installation
+    if ! command -v cloudflared &> /dev/null; then
+        log_error "cloudflared installation failed"
+        exit 1
+    fi
+    
+    local version=$(cloudflared version | head -n1)
+    log_success "Cloudflared version: $version"
+}
+
+# Create the main application with modern UI
+create_application() {
+    log_info "Creating application..."
+    
+    cat > "$INSTALL_DIR/$APP_NAME.py" << 'PYTHON_APP_EOF'
+#!/usr/bin/env python3
+"""
+CF Tunnel Helper - Professional Web GUI for Cloudflare Tunnel Management
+Modern Flask Application with Authentication Integration
+"""
+
+import os
+import json
+import subprocess
+import logging
+import socket
+import webbrowser
+from datetime import datetime
+from flask import Flask, render_template_string, request, jsonify, redirect, url_for, flash
+import psutil
+
+# Configure logging
+os.makedirs('/var/log/cftunnelhelper', exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('/var/log/cftunnelhelper/app.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+app.secret_key = os.urandom(24)
+
+class CFTunnelManager:
+    """Cloudflare Tunnel Management Class with Authentication"""
+    
+    def __init__(self):
+        self.config_path = "/etc/cftunnelhelper/config.json"
+        self.cloudflare_config_path = os.path.expanduser("~/.cloudflared")
+        self.ensure_config_exists()
+    
+    def ensure_config_exists(self):
+        """Ensure configuration file exists"""
+        os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+        if not os.path.exists(self.config_path):
+            with open(self.config_path, 'w') as f:
+                json.dump({
+                    "authenticated": False,
+                    "last_auth_check": None,
+                    "tunnels": {}
+                }, f, indent=2)
+    
+    def is_authenticated(self):
+        """Check if user is authenticated with Cloudflare"""
+        try:
+            # Check if credentials exist
+            if os.path.exists(f"{self.cloudflare_config_path}/cert.pem"):
+                result = self.run_command(['cloudflared', 'tunnel', 'list'], timeout=10)
+                return result['success']
+            return False
+        except Exception:
+            return False
+    
+    def get_auth_url(self):
+        """Get Cloudflare authentication URL"""
+        return "https://dash.cloudflare.com/profile/api-tokens"
+    
+    def run_command(self, cmd, timeout=30):
+        """Execute cloudflared command safely with better error handling"""
+        try:
+            logger.info(f"Executing command: {' '.join(cmd)}")
+            result = subprocess.run(
+                cmd, 
+                capture_output=True, 
+                text=True, 
+                timeout=timeout,
+                check=False,
+                env=dict(os.environ)
+            )
+            
+            output = {
+                'success': result.returncode == 0,
+                'stdout': result.stdout.strip(),
+                'stderr': result.stderr.strip(),
+                'returncode': result.returncode
+            }
+            
+            if not output['success']:
+                logger.error(f"Command failed: {output['stderr']}")
+            
+            return output
+            
+        except subprocess.TimeoutExpired:
+            logger.error(f"Command timed out: {' '.join(cmd)}")
+            return {
+                'success': False,
+                'stdout': '',
+                'stderr': f'Command timed out after {timeout} seconds',
+                'returncode': -1
+            }
+        except Exception as e:
+            logger.error(f"Command execution error: {str(e)}")
+            return {
+                'success': False,
+                'stdout': '',
+                'stderr': str(e),
+                'returncode': -1
+            }
+    
+    def authenticate_cloudflare(self):
+        """Start Cloudflare authentication process"""
+        result = self.run_command(['cloudflared', 'tunnel', 'login'])
+        if result['success']:
+            self.update_config({'authenticated': True, 'last_auth_check': datetime.now().isoformat()})
+        return result
+    
+    def update_config(self, updates):
+        """Update configuration file"""
+        try:
+            with open(self.config_path, 'r') as f:
+                config = json.load(f)
+            config.update(updates)
+            with open(self.config_path, 'w') as f:
+                json.dump(config, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to update config: {e}")
+    
+    def list_tunnels(self):
+        """List all tunnels with better error handling"""
+        if not self.is_authenticated():
+            return []
+        
+        result = self.run_command(['cloudflared', 'tunnel', 'list', '--output', 'json'])
+        
+        if result['success'] and result['stdout']:
+            try:
+                data = json.loads(result['stdout'])
+                return data if isinstance(data, list) else []
+            except json.JSONDecodeError:
+                logger.error("Failed to parse tunnel list JSON")
+                return []
+        
+        return []
+    
+    def create_tunnel(self, name):
+        """Create a new tunnel"""
+        if not name or not name.strip():
+            return {'success': False, 'message': 'Tunnel name is required'}
+        
+        if not self.is_authenticated():
+            return {'success': False, 'message': 'Please authenticate with Cloudflare first'}
+        
+        name = name.strip().lower().replace(' ', '-')
+        result = self.run_command(['cloudflared', 'tunnel', 'create', name])
+        
+        if result['success']:
+            logger.info(f"Tunnel '{name}' created successfully")
+            return {'success': True, 'message': f'Tunnel "{name}" created successfully'}
+        else:
+            return {'success': False, 'message': result['stderr'] or 'Failed to create tunnel'}
+    
+    def delete_tunnel(self, name):
+        """Delete a tunnel"""
+        if not name or not name.strip():
+            return {'success': False, 'message': 'Tunnel name is required'}
+        
+        if not self.is_authenticated():
+            return {'success': False, 'message': 'Please authenticate with Cloudflare first'}
+        
+        name = name.strip()
+        
+        # Try to clean up first
+        self.run_command(['cloudflared', 'tunnel', 'cleanup', name])
+        
+        # Then delete
+        result = self.run_command(['cloudflared', 'tunnel', 'delete', name, '--force'])
+        
+        if result['success']:
+            logger.info(f"Tunnel '{name}' deleted successfully")
+            return {'success': True, 'message': f'Tunnel "{name}" deleted successfully'}
+        else:
+            return {'success': False, 'message': result['stderr'] or 'Failed to delete tunnel'}
+    
+    def route_dns(self, tunnel_name, hostname):
+        """Route DNS for a tunnel"""
+        if not tunnel_name or not hostname:
+            return {'success': False, 'message': 'Tunnel name and hostname are required'}
+        
+        if not self.is_authenticated():
+            return {'success': False, 'message': 'Please authenticate with Cloudflare first'}
+        
+        tunnel_name = tunnel_name.strip()
+        hostname = hostname.strip().lower()
+        
+        result = self.run_command(['cloudflared', 'tunnel', 'route', 'dns', tunnel_name, hostname])
+        
+        if result['success']:
+            logger.info(f"DNS route created: {hostname} -> {tunnel_name}")
+            return {'success': True, 'message': f'DNS route created: {hostname} → {tunnel_name}'}
+        else:
+            return {'success': False, 'message': result['stderr'] or 'Failed to create DNS route'}
+    
+    def get_system_info(self):
+        """Get comprehensive system information"""
+        try:
+            memory = psutil.virtual_memory()
+            disk = psutil.disk_usage('/')
+            
+            return {
+                'cpu_percent': psutil.cpu_percent(interval=0.1),
+                'memory': {
+                    'percent': memory.percent,
+                    'used': self.bytes_to_gb(memory.used),
+                    'total': self.bytes_to_gb(memory.total)
+                },
+                'disk': {
+                    'percent': (disk.used / disk.total) * 100,
+                    'used': self.bytes_to_gb(disk.used),
+                    'total': self.bytes_to_gb(disk.total)
+                },
+                'cloudflared_running': self.is_cloudflared_running(),
+                'authenticated': self.is_authenticated()
+            }
+        except Exception as e:
+            logger.error(f"Error getting system info: {str(e)}")
+            return {'authenticated': False, 'cloudflared_running': False}
+    
+    def bytes_to_gb(self, bytes_val):
+        """Convert bytes to GB"""
+        return round(bytes_val / (1024**3), 2)
+    
+    def is_cloudflared_running(self):
+        """Check if any cloudflared processes are running"""
+        try:
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                if 'cloudflared' in proc.info['name']:
+                    return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+        return False
+
+# Initialize tunnel manager
+tunnel_manager = CFTunnelManager()
+
+# Modern Professional HTML Template
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CF Tunnel Helper - Professional Management Console</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.2/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary-bg: #1a1d23;
+            --secondary-bg: #252932;
+            --tertiary-bg: #2f343d;
+            --accent-blue: #007acc;
+            --accent-green: #28a745;
+            --accent-red: #dc3545;
+            --accent-orange: #fd7e14;
+            --text-primary: #ffffff;
+            --text-secondary: #b4bcc8;
+            --text-muted: #6c757d;
+            --border-color: #3d434d;
+            --success: #20c997;
+            --warning: #ffc107;
+            --danger: #e74c3c;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: linear-gradient(135deg, var(--primary-bg) 0%, #141720 100%);
+            color: var(--text-primary);
+            line-height: 1.6;
+            min-height: 100vh;
+        }
+
+        /* Navigation */
+        .navbar {
+            background: rgba(26, 29, 35, 0.95) !important;
+            backdrop-filter: blur(20px);
+            border-bottom: 1px solid var(--border-color);
+            box-shadow: 0 2px 20px rgba(0, 0, 0, 0.1);
+        }
+
+        .navbar-brand {
+            font-weight: 700;
+            font-size: 1.4rem;
+            color: var(--accent-blue) !important;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .navbar-brand i {
+            font-size: 1.6rem;
+        }
+
+        /* Cards */
+        .card {
+            background: var(--secondary-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+            transition: all 0.3s ease;
+            backdrop-filter: blur(10px);
+        }
+
+        .card:hover {
+            border-color: var(--accent-blue);
+            box-shadow: 0 8px 25px rgba(0, 122, 204, 0.1);
+        }
+
+        .card-header {
+            background: var(--tertiary-bg);
+            border-bottom: 1px solid var(--border-color);
+            border-radius: 12px 12px 0 0 !important;
+            padding: 1rem 1.25rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        /* Forms */
+        .form-control, .form-select {
+            background-color: var(--tertiary-bg);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            border-radius: 8px;
+            padding: 0.65rem 1rem;
+            transition: all 0.3s ease;
+            font-size: 0.95rem;
+        }
+
+        .form-control:focus, .form-select:focus {
+            background-color: var(--tertiary-bg);
+            border-color: var(--accent-blue);
+            color: var(--text-primary);
+            box-shadow: 0 0 0 0.25rem rgba(0, 122, 204, 0.25);
+        }
+
+        .form-control::placeholder {
+            color: var(--text-muted);
+        }
+
+        .form-label {
+            color: var(--text-secondary);
+            font-weight: 500;
+            margin-bottom: 0.5rem;
+        }
+
+        /* Buttons */
+        .btn {
+            border-radius: 8px;
+            font-weight: 500;
+            padding: 0.65rem 1.25rem;
+            border: none;
+            transition: all 0.3s ease;
+            font-size: 0.9rem;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent-blue), #005a9e);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: linear-gradient(135deg, #005a9e, #004080);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(0, 122, 204, 0.3);
+        }
+
+        .btn-success {
+            background: linear-gradient(135deg, var(--accent-green), #1e7e34);
+            color: white;
+        }
+
+        .btn-success:hover {
+            background: linear-gradient(135deg, #1e7e34, #155724);
+            transform: translateY(-1px);
+        }
+
+        .btn-danger {
+            background: linear-gradient(135deg, var(--accent-red), #c82333);
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: linear-gradient(135deg, #c82333, #a71e2a);
+            transform: translateY(-1px);
+        }
+
+        .btn-warning {
+            background: linear-gradient(135deg, var(--accent-orange), #e06610);
+            color: white;
+        }
+
+        .btn-warning:hover {
+            background: linear-gradient(135deg, #e06610, #c85d0c);
+            transform: translateY(-1px);
+        }
+
+        /* Status indicators */
+        .status-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 8px;
+            position: relative;
+        }
+
+        .status-active {
+            background-color: var(--success);
+            box-shadow: 0 0 10px rgba(32, 201, 151, 0.5);
+        }
+
+        .status-active::before {
+            content: '';
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            border-radius: 50%;
+            background-color: var(--success);
+            animation: pulse 2s infinite;
+        }
+
+        .status-inactive {
+            background-color: var(--text-muted);
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(0.95); opacity: 1; }
+            70% { transform: scale(1); opacity: 0.7; }
+            100% { transform: scale(0.95); opacity: 1; }
+        }
+
+        /* Tables */
+        .table-dark {
+            background-color: var(--secondary-bg);
+            color: var(--text-primary);
+        }
+
+        .table-dark th {
+            background-color: var(--tertiary-bg);
+            border-color: var(--border-color);
+            color: var(--text-primary);
+            font-weight: 600;
+        }
+
+        .table-dark td {
+            border-color: var(--border-color);
+            color: var(--text-secondary);
+        }
+
+        .table-hover .table-dark tbody tr:hover {
+            background-color: var(--tertiary-bg);
+        }
+
+        /* Output area */
+        .output-area {
+            background-color: var(--primary-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-family: 'Courier New', Monaco, monospace;
+            font-size: 0.85rem;
+            min-height: 200px;
+            resize: vertical;
+            padding: 1rem;
+        }
+
+        /* Progress bars */
+        .progress {
+            background-color: var(--tertiary-bg);
+            border-radius: 6px;
+            height: 8px;
+        }
+
+        .progress-bar {
+            border-radius: 6px;
+            transition: width 0.6s ease;
+        }
+
+        /* Alerts */
+        .alert {
+            border-radius: 8px;
+            border: 1px solid;
+        }
+
+        .alert-danger {
+            background-color: rgba(220, 53, 69, 0.1);
+            border-color: var(--danger);
+            color: #ff6b7a;
+        }
+
+        .alert-success {
+            background-color: rgba(32, 201, 151, 0.1);
+            border-color: var(--success);
+            color: #4dd4ac;
+        }
+
+        .alert-warning {
+            background-color: rgba(255, 193, 7, 0.1);
+            border-color: var(--warning);
+            color: #ffd43b;
+        }
+
+        /* System info cards */
+        .system-metric {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.75rem;
+            background: var(--tertiary-bg);
+            border-radius: 8px;
+            margin-bottom: 0.75rem;
+            border: 1px solid var(--border-color);
+        }
+
+        .metric-label {
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+
+        .metric-value {
+            color: var(--text-primary);
+            font-weight: 600;
+        }
+
+        /* Authentication section */
+        .auth-section {
+            text-align: center;
+            padding: 3rem 2rem;
+            background: var(--secondary-bg);
+            border-radius: 12px;
+            border: 1px solid var(--border-color);
+            margin: 2rem 0;
+        }
+
+        .auth-icon {
+            font-size: 4rem;
+            color: var(--accent-blue);
+            margin-bottom: 1.5rem;
+        }
+
+        /* Loading states */
+        .loading {
+            position: relative;
+            pointer-events: none;
+        }
+
+        .loading::after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 20px;
+            height: 20px;
+            border: 2px solid var(--border-color);
+            border-top: 2px solid var(--accent-blue);
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: translate(-50%, -50%) rotate(0deg); }
+            100% { transform: translate(-50%, -50%) rotate(360deg); }
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .container-fluid {
+                padding: 1rem;
+            }
+            
+            .card {
+                margin-bottom: 1rem;
+            }
+            
+            .btn-group {
+                flex-direction: column;
+            }
+            
+            .btn-group .btn {
+                margin-bottom: 0.5rem;
+                border-radius: 8px !important;
+            }
+        }
+
+        /* Custom scrollbar */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--primary-bg);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--border-color);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--text-muted);
+        }
+    </style>
+</head>
+<body>
+    <!-- Navigation -->
+    <nav class="navbar navbar-expand-lg sticky-top">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="/">
+                <i class="fas fa-cloud-upload-alt"></i>
+                CF Tunnel Manager
+            </a>
+            <div class="navbar-nav ms-auto">
+                <span class="navbar-text text-light">
+                    <i class="fas fa-server"></i> {{ server_ip }}:5000
+                </span>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container-fluid mt-4">
+        {% if not system_info.authenticated %}
+        <!-- Authentication Required Section -->
+        <div class="row">
+            <div class="col-12">
+                <div class="auth-section">
+                    <i class="fas fa-key auth-icon"></i>
+                    <h2 class="mb-3">Cloudflare Authentication Required</h2>
+                    <p class="text-secondary mb-4">
+                        You need to authenticate with Cloudflare to manage tunnels.<br>
+                        This will open a browser window for secure authentication.
+                    </p>
+                    <div class="d-flex gap-3 justify-content-center">
+                        <button class="btn btn-primary btn-lg" onclick="authenticateCloudflare()">
+                            <i class="fas fa-sign-in-alt"></i> Authenticate with Cloudflare
+                        </button>
+                        <a href="https://dash.cloudflare.com/profile/api-tokens" 
+                           target="_blank" 
+                           class="btn btn-outline-secondary btn-lg">
+                            <i class="fas fa-external-link-alt"></i> Manual Setup
+                        </a>
+                    </div>
+                    <div class="mt-4">
+                        <small class="text-muted">
+                            <i class="fas fa-info-circle"></i> 
+                            Authentication is secure and handled directly by Cloudflare
+                        </small>
+                    </div>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+
+        <div class="row">
+            <!-- System Information -->
+            <div class="col-lg-4 mb-4">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0">
+                            <i class="fas fa-tachometer-alt"></i> System Overview
+                        </h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="system-metric">
+                            <span class="metric-label">
+                                <i class="fas fa-microchip"></i> CPU Usage
+                            </span>
+                            <span class="metric-value">{{ "%.1f"|format(system_info.cpu_percent or 0) }}%</span>
+                        </div>
+                        
+                        <div class="system-metric">
+                            <span class="metric-label">
+                                <i class="fas fa-memory"></i> Memory
+                            </span>
+                            <span class="metric-value">
+                                {{ system_info.memory.used or 0 }}GB / {{ system_info.memory.total or 0 }}GB
+                                ({{ "%.1f"|format(system_info.memory.percent if system_info.memory else 0) }}%)
+                            </span>
+                        </div>
+                        
+                        <div class="system-metric">
+                            <span class="metric-label">
+                                <i class="fas fa-hdd"></i> Disk Usage
+                            </span>
+                            <span class="metric-value">
+                                {{ system_info.disk.used or 0 }}GB / {{ system_info.disk.total or 0 }}GB
+                                ({{ "%.1f"|format(system_info.disk.percent if system_info.disk else 0) }}%)
+                            </span>
+                        </div>
+                        
+                        <div class="system-metric">
+                            <span class="metric-label">
+                                <i class="fas fa-cloud"></i> Cloudflared
+                            </span>
+                            <span class="metric-value">
+                                <span class="status-indicator {{ 'status-active' if system_info.cloudflared_running else 'status-inactive' }}"></span>
+                                {{ 'Active' if system_info.cloudflared_running else 'Inactive' }}
+                            </span>
+                        </div>
+                        
+                        <div class="system-metric">
+                            <span class="metric-label">
+                                <i class="fas fa-key"></i> Authentication
+                            </span>
+                            <span class="metric-value">
+                                <span class="status-indicator {{ 'status-active' if system_info.authenticated else 'status-inactive' }}"></span>
+                                {{ 'Authenticated' if system_info.authenticated else 'Required' }}
+                            </span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tunnel Management -->
+            <div class="col-lg-8 mb-4">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0">
+                            <i class="fas fa-cogs"></i> Tunnel Operations
+                        </h5>
+                    </div>
+                    <div class="card-body">
+                        <form id="tunnelForm" class="row g-3">
+                            <div class="col-md-6">
+                                <label class="form-label">
+                                    <i class="fas fa-tag"></i> Tunnel Name
+                                </label>
+                                <input type="text" name="tunnel_name" class="form-control" 
+                                       placeholder="my-awesome-tunnel" required
+                                       pattern="[a-zA-Z0-9\-_]+" 
+                                       title="Only letters, numbers, hyphens, and underscores allowed">
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label">
+                                    <i class="fas fa-globe"></i> Domain/Hostname
+                                </label>
+                                <input type="text" name="hostname" class="form-control" 
+                                       placeholder="subdomain.example.com"
+                                       pattern="^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$"
+                                       title="Enter a valid domain name">
+                            </div>
+                            <div class="col-12">
+                                <div class="btn-group flex-wrap" role="group">
+                                    <button type="button" class="btn btn-success" onclick="performAction('create')" 
+                                            {% if not system_info.authenticated %}disabled{% endif %}>
+                                        <i class="fas fa-plus"></i> Create Tunnel
+                                    </button>
+                                    <button type="button" class="btn btn-primary" onclick="performAction('route')"
+                                            {% if not system_info.authenticated %}disabled{% endif %}>
+                                        <i class="fas fa-route"></i> Route DNS
+                                    </button>
+                                    <button type="button" class="btn btn-danger" onclick="performAction('delete')"
+                                            {% if not system_info.authenticated %}disabled{% endif %}>
+                                        <i class="fas fa-trash-alt"></i> Delete Tunnel
+                                    </button>
+                                    <button type="button" class="btn btn-warning" onclick="refreshTunnels()">
+                                        <i class="fas fa-sync-alt"></i> Refresh List
+                                    </button>
+                                    {% if not system_info.authenticated %}
+                                    <button type="button" class="btn btn-info" onclick="authenticateCloudflare()">
+                                        <i class="fas fa-key"></i> Authenticate
+                                    </button>
+                                    {% endif %}
+                                </div>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Active Tunnels -->
+        <div class="row">
+            <div class="col-12 mb-4">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <h5 class="mb-0">
+                            <i class="fas fa-list-ul"></i> Active Tunnels
+                        </h5>
+                        <button class="btn btn-sm btn-outline-light" onclick="refreshTunnels()">
+                            <i class="fas fa-sync-alt"></i>
+                        </button>
+                    </div>
+                    <div class="card-body">
+                        <div id="tunnelsList">
+                            <div class="d-flex justify-content-center align-items-center" style="min-height: 100px;">
+                                <div class="text-center">
+                                    <div class="spinner-border text-primary" role="status">
+                                        <span class="visually-hidden">Loading...</span>
+                                    </div>
+                                    <p class="mt-2 text-secondary">Loading tunnels...</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Command Output -->
+        <div class="row">
+            <div class="col-12 mb-4">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <h5 class="mb-0">
+                            <i class="fas fa-terminal"></i> Command Output
+                        </h5>
+                        <button class="btn btn-sm btn-outline-light" onclick="clearOutput()">
+                            <i class="fas fa-eraser"></i> Clear
+                        </button>
+                    </div>
+                    <div class="card-body">
+                        <textarea id="output" class="output-area form-control" readonly 
+                                  placeholder="Command output and system messages will appear here...">{{ output }}</textarea>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div class="toast-container position-fixed bottom-0 end-0 p-3" id="toastContainer"></div>
+
+    <!-- Scripts -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.2/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // Global state
+        let isLoading = false;
+        let authCheckInterval;
+
+        // Utility functions
+        function showToast(message, type = 'info', duration = 5000) {
+            const toastContainer = document.getElementById('toastContainer');
+            const toastId = 'toast_' + Date.now();
+            
+            const iconMap = {
+                'success': 'check-circle',
+                'error': 'exclamation-triangle',
+                'warning': 'exclamation-triangle',
+                'info': 'info-circle'
+            };
+            
+            const bgClass = {
+                'success': 'bg-success',
+                'error': 'bg-danger', 
+                'warning': 'bg-warning text-dark',
+                'info': 'bg-primary'
+            }[type] || 'bg-primary';
+
+            const icon = iconMap[type] || 'info-circle';
+
+            const toastHtml = `
+                <div id="${toastId}" class="toast ${bgClass}" role="alert" data-bs-autohide="true" data-bs-delay="${duration}">
+                    <div class="toast-header">
+                        <i class="fas fa-${icon} me-2"></i>
+                        <strong class="me-auto">CF Tunnel Manager</strong>
+                        <small>just now</small>
+                        <button type="button" class="btn-close" data-bs-dismiss="toast"></button>
+                    </div>
+                    <div class="toast-body">
+                        ${message}
+                    </div>
+                </div>
+            `;
+            
+            toastContainer.insertAdjacentHTML('beforeend', toastHtml);
+            const toast = new bootstrap.Toast(document.getElementById(toastId));
+            toast.show();
+            
+            document.getElementById(toastId).addEventListener('hidden.bs.toast', function() {
+                this.remove();
+            });
+        }
+
+        function updateOutput(text, append = false) {
+            const output = document.getElementById('output');
+            if (append) {
+                output.value += '\n' + text;
+            } else {
+                output.value = text;
+            }
+            output.scrollTop = output.scrollHeight;
+        }
+
+        function clearOutput() {
+            document.getElementById('output').value = '';
+        }
+
+        function setLoading(loading) {
+            isLoading = loading;
+            const buttons = document.querySelectorAll('button[onclick^="performAction"], button[onclick="authenticateCloudflare()"]');
+            buttons.forEach(btn => {
+                if (loading) {
+                    btn.classList.add('loading');
+                    btn.disabled = true;
+                } else {
+                    btn.classList.remove('loading');
+                    // Only enable if authenticated or it's the auth button
+                    if (!btn.onclick.toString().includes('authenticateCloudflare')) {
+                        btn.disabled = !{{ system_info.authenticated|lower }};
+                    } else {
+                        btn.disabled = false;
+                    }
+                }
+            });
+        }
+
+        // Authentication
+        async function authenticateCloudflare() {
+            if (isLoading) return;
+            
+            setLoading(true);
+            updateOutput('Starting Cloudflare authentication...');
+            showToast('Opening Cloudflare authentication...', 'info');
+            
+            try {
+                const response = await fetch('/api/authenticate', {
+                    method: 'POST'
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    updateOutput('Authentication process started. Please complete authentication in your browser.', true);
+                    showToast('Please complete authentication in your browser', 'success');
+                    
+                    // Start checking for authentication status
+                    startAuthCheck();
+                } else {
+                    updateOutput('Authentication failed: ' + result.message, true);
+                    showToast('Authentication failed: ' + result.message, 'error');
+                }
+                
+            } catch (error) {
+                updateOutput('Authentication error: ' + error.message, true);
+                showToast('Authentication error: ' + error.message, 'error');
+            } finally {
+                setLoading(false);
+            }
+        }
+
+        function startAuthCheck() {
+            let attempts = 0;
+            const maxAttempts = 30; // 5 minutes
+            
+            authCheckInterval = setInterval(async () => {
+                attempts++;
+                
+                try {
+                    const response = await fetch('/api/auth-status');
+                    const result = await response.json();
+                    
+                    if (result.authenticated) {
+                        clearInterval(authCheckInterval);
+                        showToast('Successfully authenticated with Cloudflare!', 'success');
+                        updateOutput('Authentication completed successfully!', true);
+                        setTimeout(() => location.reload(), 2000);
+                    } else if (attempts >= maxAttempts) {
+                        clearInterval(authCheckInterval);
+                        showToast('Authentication timeout. Please try again.', 'warning');
+                        updateOutput('Authentication timed out. Please try again.', true);
+                    }
+                } catch (error) {
+                    console.error('Auth check error:', error);
+                }
+            }, 10000); // Check every 10 seconds
+        }
+
+        // Tunnel operations
+        async function performAction(action) {
+            if (isLoading) return;
+            
+            const form = document.getElementById('tunnelForm');
+            const formData = new FormData(form);
+            formData.append('action', action);
+            
+            const tunnelName = formData.get('tunnel_name').trim();
+            const hostname = formData.get('hostname').trim();
+            
+            // Validation
+            if (!tunnelName && ['create', 'delete', 'route'].includes(action)) {
+                showToast('Tunnel name is required!', 'error');
+                return;
+            }
+            
+            if (action === 'route' && !hostname) {
+                showToast('Hostname is required for DNS routing!', 'error');
+                return;
+            }
+            
+            // Validate tunnel name format
+            if (tunnelName && !/^[a-zA-Z0-9\-_]+$/.test(tunnelName)) {
+                showToast('Tunnel name can only contain letters, numbers, hyphens, and underscores', 'error');
+                return;
+            }
+            
+            // Validate hostname format
+            if (hostname && action === 'route') {
+                const hostnameRegex = /^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$/;
+                if (!hostnameRegex.test(hostname)) {
+                    showToast('Please enter a valid domain name', 'error');
+                    return;
+                }
+            }
+            
+            setLoading(true);
+            
+            const actionMessages = {
+                'create': `Creating tunnel "${tunnelName}"...`,
+                'delete': `Deleting tunnel "${tunnelName}"...`,
+                'route': `Creating DNS route ${hostname} → ${tunnelName}...`
+            };
+            
+            updateOutput(actionMessages[action] || `Executing ${action} command...`);
+            
+            try {
+                const response = await fetch('/api/action', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showToast(result.message, 'success');
+                    updateOutput('✓ ' + result.message, true);
+                    
+                    // Clear form on successful create
+                    if (action === 'create') {
+                        form.reset();
+                    }
+                    
+                    // Refresh tunnels list after successful operations
+                    if (['create', 'delete', 'route'].includes(action)) {
+                        setTimeout(refreshTunnels, 1500);
+                    }
+                } else {
+                    showToast(result.message || 'Operation failed', 'error');
+                    updateOutput('✗ ' + (result.message || 'Operation failed'), true);
+                }
+                
+            } catch (error) {
+                const errorMsg = `Network error: ${error.message}`;
+                showToast(errorMsg, 'error');
+                updateOutput('✗ ' + errorMsg, true);
+            } finally {
+                setLoading(false);
+            }
+        }
+
+        // Tunnel list management
+        async function refreshTunnels() {
+            const container = document.getElementById('tunnelsList');
+            container.innerHTML = `
+                <div class="d-flex justify-content-center align-items-center" style="min-height: 100px;">
+                    <div class="text-center">
+                        <div class="spinner-border text-primary" role="status">
+                            <span class="visually-hidden">Loading...</span>
+                        </div>
+                        <p class="mt-2 text-secondary">Refreshing tunnels...</p>
+                    </div>
+                </div>
+            `;
+            
+            try {
+                const response = await fetch('/api/tunnels');
+                const tunnels = await response.json();
+                
+                if (!Array.isArray(tunnels)) {
+                    throw new Error('Invalid response format');
+                }
+                
+                if (tunnels.length === 0) {
+                    container.innerHTML = `
+                        <div class="text-center py-5">
+                            <i class="fas fa-cloud fa-4x text-secondary mb-3"></i>
+                            <h4 class="text-secondary">No Tunnels Found</h4>
+                            <p class="text-muted">Create your first tunnel using the form above.</p>
+                        </div>
+                    `;
+                } else {
+                    let tableHtml = `
+                        <div class="table-responsive">
+                            <table class="table table-dark table-hover align-middle">
+                                <thead>
+                                    <tr>
+                                        <th><i class="fas fa-tag"></i> Name</th>
+                                        <th><i class="fas fa-fingerprint"></i> Tunnel ID</th>
+                                        <th><i class="fas fa-calendar"></i> Created</th>
+                                        <th><i class="fas fa-plug"></i> Connections</th>
+                                        <th><i class="fas fa-cogs"></i> Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                    `;
+                    
+                    tunnels.forEach(tunnel => {
+                        const createdDate = tunnel.created_at ? 
+                            new Date(tunnel.created_at).toLocaleDateString('en-US', {
+                                year: 'numeric',
+                                month: 'short',
+                                day: 'numeric'
+                            }) : 'Unknown';
+                        
+                        const connections = tunnel.connections || 0;
+                        const connectionStatus = connections > 0 ? 'status-active' : 'status-inactive';
+                        
+                        tableHtml += `
+                            <tr>
+                                <td>
+                                    <strong class="text-primary">${tunnel.name}</strong>
+                                </td>
+                                <td>
+                                    <code class="text-info">${tunnel.id.substring(0, 8)}...</code>
+                                    <button class="btn btn-sm btn-outline-secondary ms-2" 
+                                            onclick="copyToClipboard('${tunnel.id}')" 
+                                            title="Copy full ID">
+                                        <i class="fas fa-copy"></i>
+                                    </button>
+                                </td>
+                                <td class="text-secondary">${createdDate}</td>
+                                <td>
+                                    <span class="status-indicator ${connectionStatus}"></span>
+                                    <span class="${connections > 0 ? 'text-success' : 'text-secondary'}">${connections}</span>
+                                </td>
+                                <td>
+                                    <div class="btn-group btn-group-sm">
+                                        <button class="btn btn-outline-info" 
+                                                onclick="showTunnelDetails('${tunnel.name}', '${tunnel.id}')"
+                                                title="View Details">
+                                            <i class="fas fa-info-circle"></i>
+                                        </button>
+                                        <button class="btn btn-outline-danger" 
+                                                onclick="deleteTunnel('${tunnel.name}')"
+                                                title="Delete Tunnel">
+                                            <i class="fas fa-trash-alt"></i>
+                                        </button>
+                                    </div>
+                                </td>
+                            </tr>
+                        `;
+                    });
+                    
+                    tableHtml += '</tbody></table></div>';
+                    container.innerHTML = tableHtml;
+                }
+                
+            } catch (error) {
+                console.error('Failed to load tunnels:', error);
+                container.innerHTML = `
+                    <div class="alert alert-danger">
+                        <i class="fas fa-exclamation-triangle"></i> 
+                        <strong>Failed to load tunnels:</strong> ${error.message}
+                        <button class="btn btn-sm btn-outline-danger ms-2" onclick="refreshTunnels()">
+                            <i class="fas fa-redo"></i> Retry
+                        </button>
+                    </div>
+                `;
+            }
+        }
+
+        // Helper functions
+        async function deleteTunnel(name) {
+            if (!confirm(`Are you sure you want to delete tunnel "${name}"?\n\nThis action cannot be undone.`)) {
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append('tunnel_name', name);
+            formData.append('action', 'delete');
+            
+            setLoading(true);
+            updateOutput(`Deleting tunnel "${name}"...`);
+            
+            try {
+                const response = await fetch('/api/action', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showToast(result.message, 'success');
+                    updateOutput('✓ ' + result.message, true);
+                    setTimeout(refreshTunnels, 1000);
+                } else {
+                    showToast(result.message || 'Failed to delete tunnel', 'error');
+                    updateOutput('✗ ' + (result.message || 'Failed to delete tunnel'), true);
+                }
+                
+            } catch (error) {
+                const errorMsg = `Network error: ${error.message}`;
+                showToast(errorMsg, 'error');
+                updateOutput('✗ ' + errorMsg, true);
+            } finally {
+                setLoading(false);
+            }
+        }
+
+        function copyToClipboard(text) {
+            navigator.clipboard.writeText(text).then(() => {
+                showToast('Tunnel ID copied to clipboard!', 'success', 2000);
+            }).catch(() => {
+                showToast('Failed to copy to clipboard', 'error');
+            });
+        }
+
+        function showTunnelDetails(name, id) {
+            const details = `Tunnel Name: ${name}\nTunnel ID: ${id}\nStatus: Active`;
+            updateOutput(`Tunnel Details:\n${details}`, true);
+            showToast(`Details for tunnel "${name}" shown in output`, 'info');
+        }
+
+        // Initialize application
+        document.addEventListener('DOMContentLoaded', function() {
+            // Initial load
+            refreshTunnels();
+            
+            // Auto-refresh tunnels every 30 seconds
+            setInterval(refreshTunnels, 30000);
+            
+            // Add some startup info
+            updateOutput(`CF Tunnel Manager initialized at ${new Date().toLocaleString()}\nServer: {{ server_ip }}:5000\nAuthenticated: {{ system_info.authenticated }}\n${'=' * 50}`);
+            
+            // Show welcome message
+            {% if system_info.authenticated %}
+            showToast('Welcome back! You are authenticated with Cloudflare.', 'success');
+            {% else %}
+            showToast('Please authenticate with Cloudflare to get started.', 'info');
+            {% endif %}
+        });
+
+        // Handle form submission
+        document.getElementById('tunnelForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+        });
+    </script>
+</body>
+</html>
+"""
+
+# Flask Routes
+@app.route("/")
+def index():
+    """Main dashboard page"""
+    try:
+        hostname = socket.gethostname()
+        server_ip = socket.gethostbyname(hostname)
+    except:
+        server_ip = "localhost"
+    
+    system_info = tunnel_manager.get_system_info()
+    
+    return render_template_string(
+        HTML_TEMPLATE, 
+        output="", 
+        server_ip=server_ip,
+        system_info=system_info
+    )
+
+@app.route("/api/tunnels")
+def api_tunnels():
+    """API endpoint to get tunnels list"""
+    try:
+        tunnels = tunnel_manager.list_tunnels()
+        return jsonify(tunnels)
+    except Exception as e:
+        logger.error(f"Error fetching tunnels: {e}")
+        return jsonify([])
+
+@app.route("/api/action", methods=["POST"])
+def api_action():
+    """API endpoint for tunnel actions"""
+    try:
+        action = request.form.get("action", "").strip()
+        tunnel_name = request.form.get("tunnel_name", "").strip()
+        hostname = request.form.get("hostname", "").strip()
+        
+        if action == "create":
+            result = tunnel_manager.create_tunnel(tunnel_name)
+        elif action == "delete":
+            result = tunnel_manager.delete_tunnel(tunnel_name)
+        elif action == "route":
+            result = tunnel_manager.route_dns(tunnel_name, hostname)
+        else:
+            result = {"success": False, "message": "Invalid action"}
+        
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"API action error: {e}")
+        return jsonify({"success": False, "message": str(e)})
+
+@app.route("/api/authenticate", methods=["POST"])
+def api_authenticate():
+    """Start Cloudflare authentication process"""
+    try:
+        result = tunnel_manager.authenticate_cloudflare()
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Authentication error: {e}")
+        return jsonify({"success": False, "message": str(e)})
+
+@app.route("/api/auth-status")
+def api_auth_status():
+    """Check authentication status"""
+    try:
+        authenticated = tunnel_manager.is_authenticated()
+        return jsonify({"authenticated": authenticated})
+    except Exception as e:
+        logger.error(f"Auth status error: {e}")
+        return jsonify({"authenticated": False})
+
+if __name__ == "__main__":
+    logger.info("Starting CF Tunnel Helper Professional...")
+    
+    # Display startup information
+    try:
+        hostname = socket.gethostname()
+        server_ip = socket.gethostbyname(hostname)
+        
+        print("\n" + "="*60)
+        print("🌟 CF TUNNEL HELPER - PROFESSIONAL EDITION 🌟")
+        print("="*60)
+        print(f"🌐 Web Interface: http://{server_ip}:5000")
+        print(f"📊 Server IP: {server_ip}")
+        print(f"🔑 Authentication: {'✓ Ready' if tunnel_manager.is_authenticated() else '⚠ Required'}")
+        print("="*60)
+        print("📋 Quick Setup:")
+        print("1. Open the web interface above")
+        if not tunnel_manager.is_authenticated():
+            print("2. Click 'Authenticate with Cloudflare'")
+            print("3. Complete authentication in your browser")
+            print("4. Return to create your first tunnel")
+        else:
+            print("2. You're already authenticated!")
+            print("3. Start creating tunnels immediately")
+        print("="*60)
+    except Exception as e:
+        logger.error(f"Startup display error: {e}")
+    
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+PYTHON_APP_EOF
+}
+
+# Create systemd service
+create_service() {
+    log_info "Creating systemd service..."
+    
+    cat > "$SERVICE_FILE" << 'SERVICE_EOF'
+[Unit]
+Description=CF Tunnel Helper - Professional Web Interface
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/cftunnelhelper
+ExecStart=/usr/bin/python3 /opt/cftunnelhelper/cftunnelhelper.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cftunnelhelper
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+SERVICE_EOF
+
+    systemctl daemon-reload
+    systemctl enable "$APP_NAME"
+}
+
+# Create advanced launcher script
+create_launcher() {
+    log_info "Creating launcher script..."
+    
+    cat > "$BIN_LINK" << 'LAUNCHER_EOF'
+#!/bin/bash
+
+# CF Tunnel Helper - Professional Launcher
+APP_DIR="/opt/cftunnelhelper"
+PID_FILE="/var/run/cftunnelhelper.pid"
+LOG_FILE="/var/log/cftunnelhelper/app.log"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+show_banner() {
+    echo -e "${BOLD}${CYAN}"
+    echo "════════════════════════════════════════════════════════════"
+    echo "🌟           CF TUNNEL HELPER - PROFESSIONAL           🌟"
+    echo "════════════════════════════════════════════════════════════"
+    echo -e "${NC}"
+}
+
+get_server_ip() {
+    hostname -I | awk '{print $1}' 2>/dev/null || echo "localhost"
+}
+
+show_status() {
+    local server_ip=$(get_server_ip)
+    echo -e "${BLUE}[INFO]${NC} Server IP: ${BOLD}$server_ip${NC}"
+    echo -e "${BLUE}[INFO]${NC} Web Interface: ${BOLD}http://$server_ip:5000${NC}"
+    
+    if [[ -f "$PID_FILE" ]]; then
+        local pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            echo -e "${GREEN}[STATUS]${NC} CF Tunnel Helper is ${BOLD}RUNNING${NC} (PID: $pid)"
+            return 0
+        else
+            echo -e "${YELLOW}[STATUS]${NC} CF Tunnel Helper is ${BOLD}STOPPED${NC} (stale PID file)"
+            rm -f "$PID_FILE"
+            return 1
+        fi
+    else
+        echo -e "${YELLOW}[STATUS]${NC} CF Tunnel Helper is ${BOLD}STOPPED${NC}"
+        return 1
+    fi
+}
+
+case "${1:-start}" in
+    start)
+        show_banner
+        echo -e "${BLUE}[INFO]${NC} Starting CF Tunnel Helper..."
+        
+        if [[ -f "$PID_FILE" ]]; then
+            PID=$(cat "$PID_FILE")
+            if kill -0 "$PID" 2>/dev/null; then
+                echo -e "${YELLOW}[WARNING]${NC} CF Tunnel Helper is already running (PID: $PID)"
+                show_status
+                exit 0
+            else
+                rm -f "$PID_FILE"
+            fi
+        fi
+        
+        cd "$APP_DIR"
+        nohup python3 cftunnelhelper.py > "$LOG_FILE" 2>&1 & 
+        echo $! > "$PID_FILE"
+        
+        sleep 3
+        if kill -0 $(cat "$PID_FILE") 2>/dev/null; then
+            echo -e "${GREEN}[SUCCESS]${NC} CF Tunnel Helper started successfully!"
+            echo ""
+            show_status
+            echo ""
+            echo -e "${CYAN}[SETUP]${NC} Quick Start Guide:"
+            echo -e "  1. Open: ${BOLD}http://$(get_server_ip):5000${NC}"
+            echo -e "  2. Click: ${BOLD}'Authenticate with Cloudflare'${NC}"
+            echo -e "  3. Complete authentication in your browser"
+            echo -e "  4. Return to create your first tunnel"
+            echo ""
+        else
+            echo -e "${RED}[ERROR]${NC} Failed to start CF Tunnel Helper"
+            rm -f "$PID_FILE"
+            exit 1
+        fi
+        ;;
+    stop)
+        echo -e "${BLUE}[INFO]${NC} Stopping CF Tunnel Helper..."
+        if [[ -f "$PID_FILE" ]]; then
+            PID=$(cat "$PID_FILE")
+            if kill -0 "$PID" 2>/dev/null; then
+                kill "$PID"
+                rm -f "$PID_FILE"
+                echo -e "${GREEN}[SUCCESS]${NC} CF Tunnel Helper stopped"
+            else
+                echo -e "${YELLOW}[INFO]${NC} CF Tunnel Helper was not running"
+                rm -f "$PID_FILE"
+            fi
+        else
+            echo -e "${YELLOW}[INFO]${NC} CF Tunnel Helper was not running"
+        fi
+        ;;
+    restart)
+        $0 stop
+        sleep 2
+        $0 start
+        ;;
+    status)
+        show_banner
+        show_status
+        echo ""
+        ;;
+    logs)
+        echo -e "${BLUE}[INFO]${NC} Showing application logs (Press Ctrl+C to exit)..."
+        echo "════════════════════════════════════════════════════════════"
+        tail -f "$LOG_FILE"
+        ;;
+    service)
+        echo -e "${BLUE}[INFO]${NC} Managing CF Tunnel Helper systemd service..."
+        case "${2:-status}" in
+            enable)
+                systemctl enable cftunnelhelper
+                echo -e "${GREEN}[SUCCESS]${NC} Service enabled for auto-start"
+                ;;
+            disable)
+                systemctl disable cftunnelhelper
+                echo -e "${GREEN}[SUCCESS]${NC} Service disabled"
+                ;;
+            start)
+                systemctl start cftunnelhelper
+                echo -e "${GREEN}[SUCCESS]${NC} Service started"
+                show_status
+                ;;
+            stop)
+                systemctl stop cftunnelhelper
+                echo -e "${GREEN}[SUCCESS]${NC} Service stopped"
+                ;;
+            restart)
+                systemctl restart cftunnelhelper
+                echo -e "${GREEN}[SUCCESS]${NC} Service restarted"
+                show_status
+                ;;
+            status|*)
+                systemctl status cftunnelhelper --no-pager
+                ;;
+        esac
+        ;;
+    web)
+        local server_ip=$(get_server_ip)
+        echo -e "${BLUE}[INFO]${NC} Opening web interface..."
+        echo -e "${CYAN}[URL]${NC} http://$server_ip:5000"
+        
+        if command -v xdg-open &> /dev/null; then
+            xdg-open "http://$server_ip:5000" 2>/dev/null || true
+        fi
+        ;;
+    install)
+        echo -e "${BLUE}[INFO]${NC} CF Tunnel Helper is already installed!"
+        show_status
+        ;;
+    *)
+        show_banner
+        echo -e "${BOLD}USAGE:${NC} $0 {start|stop|restart|status|service|logs|web}"
+        echo ""
+        echo -e "${BOLD}Commands:${NC}"
+        echo -e "  ${GREEN}start${NC}     - Start the application"
+        echo -e "  ${RED}stop${NC}      - Stop the application"
+        echo -e "  ${YELLOW}restart${NC}   - Restart the application"
+        echo -e "  ${BLUE}status${NC}    - Show application status"
+        echo -e "  ${CYAN}logs${NC}      - Show application logs (live)"
+        echo -e "  ${CYAN}web${NC}       - Open web interface"
+        echo ""
+        echo -e "${BOLD}Service Management:${NC}"
+        echo -e "  ${GREEN}service start${NC}   - Start systemd service"
+        echo -e "  ${RED}service stop${NC}    - Stop systemd service"
+        echo -e "  ${YELLOW}service restart${NC} - Restart systemd service"
+        echo -e "  ${BLUE}service status${NC}  - Show service status"
+        echo -e "  ${CYAN}service enable${NC}  - Enable auto-start on boot"
+        echo -e "  ${CYAN}service disable${NC} - Disable auto-start"
+        echo ""
+        echo -e "${BOLD}Quick Start:${NC}"
+        echo -e "  1. $0 start"
+        echo -e "  2. Open: http://$(get_server_ip):5000"
+        echo -e "  3. Authenticate with Cloudflare"
+        echo ""
+        exit 1
+        ;;
+esac
+LAUNCHER_EOF
+
+    chmod +x "$BIN_LINK"
+}
+
+# Create GitHub-style repository structure
+create_repository_files() {
+    log_info "Creating repository files..."
+    
+    # Create README
+    cat > "$INSTALL_DIR/README.md" << 'README_EOF'
+# CF Tunnel Helper - Professional Edition
+
+A modern, professional web interface for managing Cloudflare tunnels with advanced features and beautiful UI.
+
+## Features
+
+- 🌟 **Professional UI** - Modern, responsive design with dark theme
+- 🔐 **Secure Authentication** - Integrated Cloudflare authentication
+- 🚀 **Easy Management** - Create, delete, and route tunnels effortlessly  
+- 📊 **System Monitoring** - Real-time system resource monitoring
+- 🔄 **Auto-refresh** - Live updates of tunnel status
+- 📱 **Mobile Friendly** - Responsive design works on all devices
+- ⚡ **Fast & Reliable** - Optimized performance and error handling
+
+## Installation
+
+### Quick Install (Recommended)
+```bash
+curl -fsSL https://raw.githubusercontent.com/yourusername/cftunnelhelper/main/install.sh | sudo bash
+```
+
+### Manual Install
+```bash
+wget -O /tmp/install-cftunnel.sh https://raw.githubusercontent.com/yourusername/cftunnelhelper/main/install.sh
+sudo chmod +x /tmp/install-cftunnel.sh
+sudo /tmp/install-cftunnel.sh
+```
+
+## Usage
+
+### Basic Commands
+```bash
+# Start the application
+sudo cftunnelhelper start
+
+# Stop the application  
+sudo cftunnelhelper stop
+
+# Check status
+sudo cftunnelhelper status
+
+# View logs
+sudo cftunnelhelper logs
+
+# Open web interface
+sudo cftunnelhelper web
+```
+
+### Service Management
+```bash
+# Enable auto-start on boot
+sudo cftunnelhelper service enable
+
+# Start as system service
+sudo cftunnelhelper service start
+
+# Check service status
+sudo cftunnelhelper service status
+```
+
+## Web Interface
+
+After installation, access the web interface at:
+- `http://YOUR_SERVER_IP:5000`
+
+### First Time Setup
+1. Open the web interface
+2. Click "Authenticate with Cloudflare"
+3. Complete authentication in your browser
+4. Return to create your first tunnel
+
+## System Requirements
+
+- Ubuntu 18.04+ or Debian 10+
+- Python 3.6+
+- 1GB+ RAM (2GB recommended)
+- Network connectivity
+
+## License
+
+MIT License - see LICENSE file for details.
+
+## Support
+
+For issues and support, please visit: https://github.com/yourusername/cftunnelhelper/issues
+README_EOF
+
+    # Create version file
+    echo "3.0.0" > "$INSTALL_DIR/VERSION"
+    
+    # Create install info
+    cat > "$INSTALL_DIR/INSTALL_INFO" << EOF
+Installation Date: $(date)
+Server IP: $(hostname -I | awk '{print $1}')
+Ubuntu Version: $(lsb_release -d 2>/dev/null | cut -f2 || echo "Unknown")
+Python Version: $(python3 --version 2>/dev/null || echo "Unknown")
+Cloudflared Version: $(cloudflared version 2>/dev/null | head -n1 || echo "Unknown")
+EOF
+}
+
+# Create uninstall script
+create_uninstaller() {
+    log_info "Creating uninstaller..."
+    
+    cat > "$INSTALL_DIR/uninstall.sh" << 'UNINSTALL_EOF'
+#!/bin/bash
+
+# CF Tunnel Helper Uninstaller
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+echo -e "${YELLOW}CF Tunnel Helper Uninstaller${NC}"
+echo "=================================="
+
+read -p "Are you sure you want to completely remove CF Tunnel Helper? [y/N]: " -n 1 -r
+echo
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo -e "${GREEN}Uninstall cancelled.${NC}"
+    exit 0
+fi
+
+echo -e "${YELLOW}Removing CF Tunnel Helper...${NC}"
+
+# Stop services
+systemctl stop cftunnelhelper 2>/dev/null || true
+systemctl disable cftunnelhelper 2>/dev/null || true
+
+# Remove files
+rm -f /usr/local/bin/cftunnelhelper
+rm -f /etc/systemd/system/cftunnelhelper.service
+rm -rf /opt/cftunnelhelper
+rm -rf /var/log/cftunnelhelper
+rm -rf /etc/cftunnelhelper
+
+# Reload systemd
+systemctl daemon-reload
+
+echo -e "${GREEN}CF Tunnel Helper has been completely removed.${NC}"
+echo -e "${YELLOW}Note: Cloudflared and Python packages were left installed.${NC}"
+UNINSTALL_EOF
+
+    chmod +x "$INSTALL_DIR/uninstall.sh"
+}
+
+# Final setup and display
+final_setup() {
+    log_info "Performing final setup..."
+    
+    # Set proper permissions
+    chown -R root:root "$INSTALL_DIR"
+    chmod -R 755 "$INSTALL_DIR"
+    chmod 644 "$INSTALL_DIR"/*.py "$INSTALL_DIR"/*.md 2>/dev/null || true
+    
+    # Create firewall rule (optional)
+    if command -v ufw &> /dev/null; then
+        log_info "Configuring firewall..."
+        ufw allow 5000/tcp comment "CF Tunnel Helper" 2>/dev/null || true
+    fi
+    
+    # Display installation summary
+    local server_ip=$(hostname -I | awk '{print $1}' || echo "localhost")
+    
+    log_success "Installation completed successfully!"
+    echo
+    log_header "╔══════════════════════════════════════════════════════════╗"
+    log_header "║              🌟 CF TUNNEL HELPER - READY! 🌟              ║"
+    log_header "╚══════════════════════════════════════════════════════════╝"
+    echo
+    log_info "🌐 Web Interface: ${BOLD}http://$server_ip:5000${NC}"
+    log_info "📋 Quick Commands:"
+    log_info "   • Start:  ${GREEN}sudo $APP_NAME start${NC}"
+    log_info "   • Stop:   ${RED}sudo $APP_NAME stop${NC}"  
+    log_info "   • Status: ${BLUE}sudo $APP_NAME status${NC}"
+    log_info "   • Logs:   ${CYAN}sudo $APP_NAME logs${NC}"
+    echo
+    log_info "🚀 Next Steps:"
+    log_info "   1. Open: http://$server_ip:5000"
+    log_info "   2. Click: 'Authenticate with Cloudflare'"
+    log_info "   3. Complete authentication in browser"
+    log_info "   4. Create your first tunnel!"
+    echo
+    log_info "📖 Documentation: /opt/$APP_NAME/README.md"
+    log_info "🗑️  Uninstall: sudo /opt/$APP_NAME/uninstall.sh"
+    echo
+}
+
+# Main installation function
+main() {
+    log_header "╔══════════════════════════════════════════════════════════╗"
+    log_header "║         CF TUNNEL HELPER - PROFESSIONAL INSTALLER         ║"
+    log_header "╚══════════════════════════════════════════════════════════╝"
+    echo
+    
+    check_root
+    detect_ubuntu_version
+    create_directories
+    install_dependencies
+    install_cloudflared
+    create_application
+    create_service
+    create_launcher
+    create_repository_files
+    create_uninstaller
+    final_setup
+    
+    # Start the application
+    log_info "Starting CF Tunnel Helper..."
+    sleep 2
+    "$BIN_LINK" start
+}
+
+# Run main function
+main "$@"
