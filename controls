@@ -1,0 +1,14 @@
+# Start the application
+sudo cftunnelhelper start
+
+# Stop the application  
+sudo cftunnelhelper stop
+
+# Check status
+sudo cftunnelhelper status
+
+# View logs
+sudo cftunnelhelper logs
+
+# Open web interface
+sudo cftunnelhelper web
